@@ -250,7 +250,7 @@ func SetSemiSyncReplica(instanceKey *InstanceKey, enableReplica bool) (*Instance
 }
 
 func RestartReplicationQuick(instanceKey *InstanceKey) error {
-	for _, cmd := range []string{`stop slave sql_thread`, `stop slave io_thread`, `start slave io_thread`, `start slave sql_thread`} {
+	for _, cmd := range []string{`stop slave io_thread`, `start slave io_thread`} {
 		if _, err := ExecInstance(instanceKey, cmd); err != nil {
 			return log.Errorf("%+v: RestartReplicationQuick: '%q' failed: %+v", *instanceKey, cmd, err)
 		} else {
@@ -532,7 +532,6 @@ func WaitForExecBinlogCoordinatesToReach(instanceKey *InstanceKey, coordinates *
 			return instance, false, nil
 		}
 	}
-	return instance, exactMatch, err
 }
 
 // StartReplicationUntilMasterCoordinates issuesa START SLAVE UNTIL... statement on given instance

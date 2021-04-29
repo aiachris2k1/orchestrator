@@ -35,7 +35,7 @@ import (
 	ometrics "github.com/openark/orchestrator/go/metrics"
 	"github.com/openark/orchestrator/go/os"
 	"github.com/openark/orchestrator/go/process"
-	"github.com/openark/orchestrator/go/raft"
+	orcraft "github.com/openark/orchestrator/go/raft"
 	"github.com/openark/orchestrator/go/util"
 	"github.com/patrickmn/go-cache"
 	"github.com/rcrowley/go-metrics"
@@ -93,28 +93,29 @@ type BlockedTopologyRecovery struct {
 type TopologyRecovery struct {
 	inst.PostponedFunctionsContainer
 
-	Id                        int64
-	UID                       string
-	AnalysisEntry             inst.ReplicationAnalysis
-	SuccessorKey              *inst.InstanceKey
-	SuccessorAlias            string
-	IsActive                  bool
-	IsSuccessful              bool
-	LostReplicas              inst.InstanceKeyMap
-	ParticipatingInstanceKeys inst.InstanceKeyMap
-	AllErrors                 []string
-	RecoveryStartTimestamp    string
-	RecoveryEndTimestamp      string
-	ProcessingNodeHostname    string
-	ProcessingNodeToken       string
-	Acknowledged              bool
-	AcknowledgedAt            string
-	AcknowledgedBy            string
-	AcknowledgedComment       string
-	LastDetectionId           int64
-	RelatedRecoveryId         int64
-	Type                      RecoveryType
-	RecoveryType              MasterRecoveryType
+	Id                         int64
+	UID                        string
+	AnalysisEntry              inst.ReplicationAnalysis
+	SuccessorKey               *inst.InstanceKey
+	SuccessorAlias             string
+	SuccessorBinlogCoordinates *inst.BinlogCoordinates
+	IsActive                   bool
+	IsSuccessful               bool
+	LostReplicas               inst.InstanceKeyMap
+	ParticipatingInstanceKeys  inst.InstanceKeyMap
+	AllErrors                  []string
+	RecoveryStartTimestamp     string
+	RecoveryEndTimestamp       string
+	ProcessingNodeHostname     string
+	ProcessingNodeToken        string
+	Acknowledged               bool
+	AcknowledgedAt             string
+	AcknowledgedBy             string
+	AcknowledgedComment        string
+	LastDetectionId            int64
+	RelatedRecoveryId          int64
+	Type                       RecoveryType
+	RecoveryType               MasterRecoveryType
 }
 
 func NewTopologyRecovery(replicationAnalysis inst.ReplicationAnalysis) *TopologyRecovery {
@@ -122,6 +123,7 @@ func NewTopologyRecovery(replicationAnalysis inst.ReplicationAnalysis) *Topology
 	topologyRecovery.UID = util.PrettyUniqueToken()
 	topologyRecovery.AnalysisEntry = replicationAnalysis
 	topologyRecovery.SuccessorKey = nil
+	topologyRecovery.SuccessorBinlogCoordinates = nil
 	topologyRecovery.LostReplicas = *inst.NewInstanceKeyMap()
 	topologyRecovery.ParticipatingInstanceKeys = *inst.NewInstanceKeyMap()
 	topologyRecovery.AllErrors = []string{}
@@ -251,6 +253,8 @@ func resolveRecovery(topologyRecovery *TopologyRecovery, successorInstance *inst
 		topologyRecovery.SuccessorKey = &successorInstance.Key
 		topologyRecovery.SuccessorAlias = successorInstance.InstanceAlias
 		topologyRecovery.IsSuccessful = true
+		// Assign the current Binlog Coordinates of Successor Instance
+		topologyRecovery.SuccessorBinlogCoordinates = &successorInstance.SelfBinlogCoordinates
 	}
 	if orcraft.IsRaftEnabled() {
 		_, err := orcraft.PublishCommand("resolve-recovery", topologyRecovery)
@@ -291,6 +295,11 @@ func prepareCommand(command string, topologyRecovery *TopologyRecovery) (result 
 	if topologyRecovery.SuccessorKey != nil {
 		command = strings.Replace(command, "{successorHost}", topologyRecovery.SuccessorKey.Hostname, -1)
 		command = strings.Replace(command, "{successorPort}", fmt.Sprintf("%d", topologyRecovery.SuccessorKey.Port), -1)
+		// As long as SuccessorBinlogCoordinates != nil, we replace {successorBinlogCoordinates}
+		// Format of the display string of binlog coordinates would be LogFile:LogPositon
+		if topologyRecovery.SuccessorBinlogCoordinates != nil {
+			command = strings.Replace(command, "{successorBinlogCoordinates}", topologyRecovery.SuccessorBinlogCoordinates.DisplayString(), -1)
+		}
 		// As long as SucesssorKey != nil, we replace {successorAlias}.
 		// If SucessorAlias is "", it's fine. We'll replace {successorAlias} with "".
 		command = strings.Replace(command, "{successorAlias}", topologyRecovery.SuccessorAlias, -1)
@@ -333,6 +342,11 @@ func applyEnvironmentVariables(topologyRecovery *TopologyRecovery) []string {
 	if topologyRecovery.SuccessorKey != nil {
 		env = append(env, fmt.Sprintf("ORC_SUCCESSOR_HOST=%s", topologyRecovery.SuccessorKey.Hostname))
 		env = append(env, fmt.Sprintf("ORC_SUCCESSOR_PORT=%d", topologyRecovery.SuccessorKey.Port))
+		// As long as SuccessorBinlogCoordinates != nil, we set ORC_SUCCESSOR_BINLOG_COORDINATES
+		// Format of the display string of binlog coordinates would be LogFile:LogPositon
+		if topologyRecovery.SuccessorBinlogCoordinates != nil {
+			env = append(env, fmt.Sprintf("ORC_SUCCESSOR_BINLOG_COORDINATES=%s", topologyRecovery.SuccessorBinlogCoordinates.DisplayString()))
+		}
 		// As long as SucesssorKey != nil, we replace {successorAlias}.
 		// If SucessorAlias is "", it's fine. We'll replace {successorAlias} with "".
 		env = append(env, fmt.Sprintf("ORC_SUCCESSOR_ALIAS=%s", topologyRecovery.SuccessorAlias))
@@ -1436,7 +1450,34 @@ func checkAndRecoverDeadCoMaster(analysisEntry inst.ReplicationAnalysis, candida
 	return true, topologyRecovery, err
 }
 
-// checkAndRecoverGenericProblem is a general-purpose recovery function
+// checkAndRecoverNonWriteableMaster attempts to recover from a read only master by turning it writeable.
+// This behavior is feature protected, see config.Config.RecoverNonWriteableMaster
+func checkAndRecoverNonWriteableMaster(analysisEntry inst.ReplicationAnalysis, candidateInstanceKey *inst.InstanceKey, forceInstanceRecovery bool, skipProcesses bool) (recoveryAttempted bool, topologyRecovery *TopologyRecovery, err error) {
+	if !config.Config.RecoverNonWriteableMaster {
+		return false, nil, nil
+	}
+
+	topologyRecovery, err = AttemptRecoveryRegistration(&analysisEntry, true, true)
+	if topologyRecovery == nil {
+		AuditTopologyRecovery(topologyRecovery, fmt.Sprintf("found an active or recent recovery on %+v. Will not issue another checkAndRecoverNonWriteableMaster.", analysisEntry.AnalyzedInstanceKey))
+		return false, nil, err
+	}
+
+	inst.AuditOperation("recover-non-writeable-master", &analysisEntry.AnalyzedInstanceKey, "problem found; will recover")
+	if !skipProcesses {
+		if err := executeProcesses(config.Config.PreFailoverProcesses, "PreFailoverProcesses", topologyRecovery, true); err != nil {
+			return false, topologyRecovery, topologyRecovery.AddError(err)
+		}
+	}
+
+	instance, err := inst.SetReadOnly(&analysisEntry.AnalyzedInstanceKey, false)
+	if err == nil {
+		resolveRecovery(topologyRecovery, instance)
+	}
+	return true, topologyRecovery, err
+}
+
+// checkAndRecoverLockedSemiSyncMaster
 func checkAndRecoverLockedSemiSyncMaster(analysisEntry inst.ReplicationAnalysis, candidateInstanceKey *inst.InstanceKey, forceInstanceRecovery bool, skipProcesses bool) (recoveryAttempted bool, topologyRecovery *TopologyRecovery, err error) {
 
 	topologyRecovery, err = AttemptRecoveryRegistration(&analysisEntry, true, true)
@@ -1650,6 +1691,9 @@ func getCheckAndRecoverFunction(analysisCode inst.AnalysisCode, analyzedInstance
 	// replication group members
 	case inst.DeadReplicationGroupMemberWithReplicas:
 		return checkAndRecoverDeadGroupMemberWithReplicas, true
+	// recoverable structure analysis
+	case inst.NoWriteableMasterStructureWarning:
+		return checkAndRecoverNonWriteableMaster, true
 	}
 	// Right now this is mostly causing noise with no clear action.
 	// Will revisit this in the future.
